@@ -17,6 +17,7 @@
 (function(global, undefined) {
   var JsDiff = (function() {
     /*jshint maxparams: 5*/
+    /*istanbul ignore next*/
     function map(arr, mapper, that) {
       if (Array.prototype.map) {
         return Array.prototype.map.call(arr, mapper, that);
@@ -51,20 +52,66 @@
       return n;
     }
 
+    function buildValues(components, newString, oldString, useLongestToken) {
+      var componentPos = 0,
+          componentLen = components.length,
+          newPos = 0,
+          oldPos = 0;
+
+      for (; componentPos < componentLen; componentPos++) {
+        var component = components[componentPos];
+        if (!component.removed) {
+          if (!component.added && useLongestToken) {
+            var value = newString.slice(newPos, newPos + component.count);
+            value = map(value, function(value, i) {
+              var oldValue = oldString[oldPos + i];
+              return oldValue.length > value.length ? oldValue : value;
+            });
+
+            component.value = value.join('');
+          } else {
+            component.value = newString.slice(newPos, newPos + component.count).join('');
+          }
+          newPos += component.count;
+
+          // Common case
+          if (!component.added) {
+            oldPos += component.count;
+          }
+        } else {
+          component.value = oldString.slice(oldPos, oldPos + component.count).join('');
+          oldPos += component.count;
+        }
+      }
+
+      return components;
+    }
+
     var Diff = function(ignoreWhitespace) {
       this.ignoreWhitespace = ignoreWhitespace;
     };
     Diff.prototype = {
-        diff: function(oldString, newString) {
+        diff: function(oldString, newString, callback) {
+          var self = this;
+
+          function done(value) {
+            if (callback) {
+              setTimeout(function() { callback(undefined, value); }, 0);
+              return true;
+            } else {
+              return value;
+            }
+          }
+
           // Handle the identity case (this is due to unrolling editLength == 0
           if (newString === oldString) {
-            return [{ value: newString }];
+            return done([{ value: newString }]);
           }
           if (!newString) {
-            return [{ value: oldString, removed: true }];
+            return done([{ value: oldString, removed: true }]);
           }
           if (!oldString) {
-            return [{ value: newString, added: true }];
+            return done([{ value: newString, added: true }]);
           }
 
           newString = this.tokenize(newString);
@@ -74,13 +121,15 @@
           var maxEditLength = newLen + oldLen;
           var bestPath = [{ newPos: -1, components: [] }];
 
-          // Seed editLength = 0
+          // Seed editLength = 0, i.e. the content starts with the same values
           var oldPos = this.extractCommon(bestPath[0], newString, oldString, 0);
           if (bestPath[0].newPos+1 >= newLen && oldPos+1 >= oldLen) {
-            return bestPath[0].components;
+            // Identity per the equality and tokenizer
+            return done([{value: newString.join('')}]);
           }
 
-          for (var editLength = 1; editLength <= maxEditLength; editLength++) {
+          // Main worker method. checks all permutations of a given edit length for acceptance.
+          function execEditLength() {
             for (var diagonalPath = -1*editLength; diagonalPath <= editLength; diagonalPath+=2) {
               var basePath;
               var addPath = bestPath[diagonalPath-1],
@@ -94,6 +143,7 @@
               var canAdd = addPath && addPath.newPos+1 < newLen;
               var canRemove = removePath && 0 <= oldPos && oldPos < oldLen;
               if (!canAdd && !canRemove) {
+                // If this path is a terminal then prune
                 bestPath[diagonalPath] = undefined;
                 continue;
               }
@@ -103,63 +153,92 @@
               // and does not pass the bounds of the diff graph
               if (!canAdd || (canRemove && addPath.newPos < removePath.newPos)) {
                 basePath = clonePath(removePath);
-                this.pushComponent(basePath.components, oldString[oldPos], undefined, true);
+                self.pushComponent(basePath.components, undefined, true);
               } else {
-                basePath = clonePath(addPath);
+                basePath = addPath;   // No need to clone, we've pulled it from the list
                 basePath.newPos++;
-                this.pushComponent(basePath.components, newString[basePath.newPos], true, undefined);
+                self.pushComponent(basePath.components, true, undefined);
               }
 
-              var oldPos = this.extractCommon(basePath, newString, oldString, diagonalPath);
+              var oldPos = self.extractCommon(basePath, newString, oldString, diagonalPath);
 
+              // If we have hit the end of both strings, then we are done
               if (basePath.newPos+1 >= newLen && oldPos+1 >= oldLen) {
-                return basePath.components;
+                return done(buildValues(basePath.components, newString, oldString, self.useLongestToken));
               } else {
+                // Otherwise track this path as a potential candidate and continue.
                 bestPath[diagonalPath] = basePath;
+              }
+            }
+
+            editLength++;
+          }
+
+          // Performs the length of edit iteration. Is a bit fugly as this has to support the 
+          // sync and async mode which is never fun. Loops over execEditLength until a value
+          // is produced.
+          var editLength = 1;
+          if (callback) {
+            (function exec() {
+              setTimeout(function() {
+                // This should not happen, but we want to be safe.
+                /*istanbul ignore next */
+                if (editLength > maxEditLength) {
+                  return callback();
+                }
+
+                if (!execEditLength()) {
+                  exec();
+                }
+              }, 0);
+            })();
+          } else {
+            while(editLength <= maxEditLength) {
+              var ret = execEditLength();
+              if (ret) {
+                return ret;
               }
             }
           }
         },
 
-        pushComponent: function(components, value, added, removed) {
+        pushComponent: function(components, added, removed) {
           var last = components[components.length-1];
           if (last && last.added === added && last.removed === removed) {
             // We need to clone here as the component clone operation is just
             // as shallow array clone
-            components[components.length-1] =
-              {value: this.join(last.value, value), added: added, removed: removed };
+            components[components.length-1] = {count: last.count + 1, added: added, removed: removed };
           } else {
-            components.push({value: value, added: added, removed: removed });
+            components.push({count: 1, added: added, removed: removed });
           }
         },
         extractCommon: function(basePath, newString, oldString, diagonalPath) {
           var newLen = newString.length,
               oldLen = oldString.length,
               newPos = basePath.newPos,
-              oldPos = newPos - diagonalPath;
+              oldPos = newPos - diagonalPath,
+
+              commonCount = 0;
           while (newPos+1 < newLen && oldPos+1 < oldLen && this.equals(newString[newPos+1], oldString[oldPos+1])) {
             newPos++;
             oldPos++;
-
-            this.pushComponent(basePath.components, newString[newPos], undefined, undefined);
+            commonCount++;
           }
+
+          if (commonCount) {
+            basePath.components.push({count: commonCount});
+          }
+
           basePath.newPos = newPos;
           return oldPos;
         },
 
         equals: function(left, right) {
           var reWhitespace = /\S/;
-          if (this.ignoreWhitespace && !reWhitespace.test(left) && !reWhitespace.test(right)) {
-            return true;
-          } else {
-            return left === right;
-          }
-        },
-        join: function(left, right) {
-          return left + right;
+          return left === right || (this.ignoreWhitespace && !reWhitespace.test(left) && !reWhitespace.test(right));
         },
         tokenize: function(value) {
-          return value;
+          return value.split('');
         }
     };
 
@@ -186,7 +265,7 @@
             lastLine = lines[i - 1];
 
         // Merge lines that may contain windows new lines
-        if (line == '\n' && lastLine && lastLine[lastLine.length - 1] === '\r') {
+        if (line === '\n' && lastLine && lastLine[lastLine.length - 1] === '\r') {
           retLines[retLines.length - 1] += '\n';
         } else if (line) {
           retLines.push(line);
@@ -196,15 +275,85 @@
       return retLines;
     };
 
+    var SentenceDiff = new Diff();
+    SentenceDiff.tokenize = function (value) {
+      return removeEmpty(value.split(/(\S.+?[.!?])(?=\s+|$)/));
+    };
+
+    var JsonDiff = new Diff();
+    // Discriminate between two lines of pretty-printed, serialized JSON where one of them has a
+    // dangling comma and the other doesn't. Turns out including the dangling comma yields the nicest output:
+    JsonDiff.useLongestToken = true;
+    JsonDiff.tokenize = LineDiff.tokenize;
+    JsonDiff.equals = function(left, right) {
+      return LineDiff.equals(left.replace(/,([\r\n])/g, '$1'), right.replace(/,([\r\n])/g, '$1'));
+    };
+
+    var objectPrototypeToString = Object.prototype.toString;
+
+    // This function handles the presence of circular references by bailing out when encountering an
+    // object that is already on the "stack" of items being processed.
+    function canonicalize(obj, stack, replacementStack) {
+      stack = stack || [];
+      replacementStack = replacementStack || [];
+
+      var i;
+
+      for (var i = 0 ; i < stack.length ; i += 1) {
+        if (stack[i] === obj) {
+          return replacementStack[i];
+        }
+      }
+
+      var canonicalizedObj;
+
+      if ('[object Array]' === objectPrototypeToString.call(obj)) {
+        stack.push(obj);
+        canonicalizedObj = new Array(obj.length);
+        replacementStack.push(canonicalizedObj);
+        for (i = 0 ; i < obj.length ; i += 1) {
+          canonicalizedObj[i] = canonicalize(obj[i], stack, replacementStack);
+        }
+        stack.pop();
+        replacementStack.pop();
+      } else if (typeof obj === 'object' && obj !== null) {
+        stack.push(obj);
+        canonicalizedObj = {};
+        replacementStack.push(canonicalizedObj);
+        var sortedKeys = [];
+        for (var key in obj) {
+          sortedKeys.push(key);
+        }
+        sortedKeys.sort();
+        for (i = 0 ; i < sortedKeys.length ; i += 1) {
+          var key = sortedKeys[i];
+          canonicalizedObj[key] = canonicalize(obj[key], stack, replacementStack);
+        }
+        stack.pop();
+        replacementStack.pop();
+      } else {
+        canonicalizedObj = obj;
+      }
+      return canonicalizedObj;
+    }
+
     return {
       Diff: Diff,
 
-      diffChars: function(oldStr, newStr) { return CharDiff.diff(oldStr, newStr); },
-      diffWords: function(oldStr, newStr) { return WordDiff.diff(oldStr, newStr); },
-      diffWordsWithSpace: function(oldStr, newStr) { return WordWithSpaceDiff.diff(oldStr, newStr); },
-      diffLines: function(oldStr, newStr) { return LineDiff.diff(oldStr, newStr); },
+      diffChars: function(oldStr, newStr, callback) { return CharDiff.diff(oldStr, newStr, callback); },
+      diffWords: function(oldStr, newStr, callback) { return WordDiff.diff(oldStr, newStr, callback); },
+      diffWordsWithSpace: function(oldStr, newStr, callback) { return WordWithSpaceDiff.diff(oldStr, newStr, callback); },
+      diffLines: function(oldStr, newStr, callback) { return LineDiff.diff(oldStr, newStr, callback); },
+      diffSentences: function(oldStr, newStr, callback) { return SentenceDiff.diff(oldStr, newStr, callback); },
 
-      diffCss: function(oldStr, newStr) { return CssDiff.diff(oldStr, newStr); },
+      diffCss: function(oldStr, newStr, callback) { return CssDiff.diff(oldStr, newStr, callback); },
+      diffJson: function(oldObj, newObj, callback) {
+        return JsonDiff.diff(
+          typeof oldObj === 'string' ? oldObj : JSON.stringify(canonicalize(oldObj), undefined, '  '),
+          typeof newObj === 'string' ? newObj : JSON.stringify(canonicalize(newObj), undefined, '  '),
+          callback
+        );
+      },
 
       createPatch: function(fileName, oldStr, newStr, oldHeader, newHeader) {
         var ret = [];
@@ -373,14 +522,18 @@
           ret.push([(change.added ? 1 : change.removed ? -1 : 0), change.value]);
         }
         return ret;
-      }
+      },
+
+      canonicalize: canonicalize
     };
   })();
 
+  /*istanbul ignore next */
   if (typeof module !== 'undefined') {
       module.exports = JsDiff;
   }
   else if (typeof define === 'function') {
+    /*global define */
     define([], function() { return JsDiff; });
   }
   else if (typeof global.JsDiff === 'undefined') {
