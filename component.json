@@ -6,7 +6,7 @@
     "diff",
     "text"
   ],
-  "version": "1.0.7",
+  "version": "1.0.8",
   "scripts": [ "diff.js" ],
   "main":  "diff.js",
   "license": "BSD"
